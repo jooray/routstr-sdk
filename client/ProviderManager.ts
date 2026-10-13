@@ -1237,7 +1237,7 @@ export class ProviderManager {
     modelId: string,
     currentBaseUrl: string,
     attemptedProviders: ReadonlySet<string> = new Set(),
-    options: { acceptableMintUrls?: string[] } = {}
+    options: { acceptableMintUrls?: string[]; requireConfidential?: boolean } = {}
   ): string | null {
     modelId = this.canonicalizeModelId(modelId);
     try {
@@ -1298,6 +1298,11 @@ export class ProviderManager {
         // mapped variant/alias of it)
         const model = findModelForId(models, modelId, this.getModelIdMappings());
         if (!model) {
+          continue;
+        }
+        // A confidential request needs a node that offers confidential
+        // sessions for this model.
+        if (options.requireConfidential && !model.confidential_upstream) {
           continue;
         }
 
