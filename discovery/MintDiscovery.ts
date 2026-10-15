@@ -4,11 +4,29 @@
  */
 
 import type { DiscoveryAdapter, ProviderInfo } from "./interfaces";
+import { withProviderDeadline } from "./providerDeadline";
 import type { SdkLogger } from "../core/types";
 import { consoleLogger } from "../core/types";
+import {
+  classifyProviderFailure,
+  diffProviderOutage,
+  type ProviderFailure,
+  type ProviderOutcome,
+} from "./providerOutageReport";
 
 // A hanging provider must not hold an info pass open indefinitely.
 const INFO_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * One provider's slot in a mint pass. `success` is false when the provider did
+ * not answer, in which case `failure` carries the classified reason for the
+ * end-of-pass report.
+ */
+type MintPassOutcome = ProviderOutcome & {
+  success: boolean;
+  mints: string[];
+  info: ProviderInfo | null;
+};
 
 /**
  * Configuration for MintDiscovery
@@ -30,6 +48,11 @@ export class MintDiscovery {
   // Tracked here, not via the adapter's provider timestamp: that stamp
   // belongs to the model cache and mint refreshes kept it alive forever.
   private lastMintFetch = new Map<string, number>();
+  private providerInfoRequests = new Map<string, Promise<ProviderInfo>>();
+  // Last pass's failures, so an unchanged outage collapses into the summary
+  // instead of re-printing a line per provider per pass. See the report for
+  // the transition rules.
+  private providerFailures = new Map<string, ProviderFailure>();
 
   constructor(
     private adapter: DiscoveryAdapter,
@@ -56,12 +79,14 @@ export class MintDiscovery {
       return { mintsFromProviders: {}, infoFromProviders: {} };
     }
 
-    const mintsFromAllProviders: Record<string, string[]> = {};
-    const infoFromAllProviders: Record<string, ProviderInfo> = {};
     const forceRefresh = options.forceRefresh ?? false;
+    const startedAt = Date.now();
+    // Only network-fetched bases count as retried, so a provider served from
+    // cache is never reported recovered on the strength of a stale entry.
+    const freshlyFetched = new Set<string>();
 
     // Fetch info from each provider
-    const fetchPromises = baseUrls.map(async (url) => {
+    const fetchPromises = baseUrls.map(async (url): Promise<MintPassOutcome> => {
       const base = url.endsWith("/") ? url : `${url}/`;
       try {
         if (!forceRefresh) {
@@ -71,10 +96,6 @@ export class MintDiscovery {
           if (cacheValid) {
             const cachedMints = this.adapter.getCachedMints()[base] || [];
             const cachedInfo = this.adapter.getCachedProviderInfo()[base];
-            mintsFromAllProviders[base] = cachedMints;
-            if (cachedInfo) {
-              infoFromAllProviders[base] = cachedInfo;
-            }
             return {
               success: true,
               base,
@@ -84,71 +105,76 @@ export class MintDiscovery {
           }
         }
 
-        const res = await fetch(`${base}v1/info`, {
-          signal: AbortSignal.timeout(INFO_FETCH_TIMEOUT_MS),
-        });
-        if (!res.ok) {
-          throw new Error(`Failed to fetch info: ${res.status}`);
-        }
-
-        const json = await res.json();
-
-        // Extract mints array from response
-        const mints: string[] = Array.isArray(json?.mints) ? json.mints : [];
-
-        // Normalize mint URLs (remove trailing slashes for consistency)
-        const normalizedMints = mints.map((mint) =>
-          mint.endsWith("/") ? mint.slice(0, -1) : mint
-        );
-
-        // Save provider mints and full info
-        mintsFromAllProviders[base] = normalizedMints;
-        infoFromAllProviders[base] = json;
-        this.lastMintFetch.set(base, Date.now());
+        const json = await this.fetchProviderInfo(base);
+        const normalizedMints = this.adapter.getCachedMints()[base] ?? [];
+        freshlyFetched.add(base);
 
         return { success: true, base, mints: normalizedMints, info: json };
       } catch (error) {
-        if (this.isProviderDownError(error)) {
-          this.logger.warn(`Provider ${base} is down right now.`);
-        } else {
-          this.logger.warn(`Failed to fetch mints from ${base}:`, error);
-        }
-        return { success: false, base, mints: [], info: null };
+        // No stamp on failure, so the provider is retried next pass. The raw
+        // error is carried to the end-of-pass report rather than logged here:
+        // a node that has been down for days must not re-print its stack on
+        // every refresh. See reportProviderFailures().
+        return {
+          success: false,
+          base,
+          mints: [],
+          info: null,
+          failure: classifyProviderFailure(error),
+        };
       }
     });
 
     // Wait for all to complete (but allow individual failures)
     const results = await Promise.allSettled(fetchPromises);
 
-    // Handle results
+    this.reportProviderFailures(
+      results.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : []
+      ),
+      freshlyFetched,
+      baseUrls.length,
+      Date.now() - startedAt
+    );
+
     for (const result of results) {
-      if (result.status === "fulfilled") {
-        const { success, base, mints, info } = result.value;
-        if (!success) continue;
-        mintsFromAllProviders[base] = mints;
-        if (info) {
-          infoFromAllProviders[base] = info;
-        }
-      } else {
+      if (result.status === "rejected") {
         this.logger.error("Mint discovery error:", result.reason);
       }
     }
 
-    // Merge into the latest cache: transient failures must not erase known
-    // restrictions, and concurrent provider-info writes must not be lost.
-    const mergedMints = { ...this.adapter.getCachedMints(), ...mintsFromAllProviders };
-    const mergedInfo = { ...this.adapter.getCachedProviderInfo(), ...infoFromAllProviders };
-    try {
-      this.adapter.setCachedMints(mergedMints);
-      this.adapter.setCachedProviderInfo(mergedInfo);
-    } catch (error) {
-      this.logger.error("Error caching mint discovery results:", error);
-    }
-
+    // Successes were published immediately. Do not merge an older pass's
+    // snapshot here: it could overwrite advertisements refreshed meanwhile.
     return {
-      mintsFromProviders: mergedMints,
-      infoFromProviders: mergedInfo,
+      mintsFromProviders: this.adapter.getCachedMints(),
+      infoFromProviders: this.adapter.getCachedProviderInfo(),
     };
+  }
+
+  private fetchProviderInfo(base: string): Promise<ProviderInfo> {
+    const running = this.providerInfoRequests.get(base);
+    if (running) return running;
+
+    const request = withProviderDeadline(async (signal) => {
+      const res = await fetch(`${base}v1/info`, { signal });
+      if (!res.ok) throw new Error(`Failed to fetch info: ${res.status}`);
+      return await res.json() as ProviderInfo;
+    }, INFO_FETCH_TIMEOUT_MS).then((info) => {
+      const mints: string[] = Array.isArray(info?.mints) ? info.mints : [];
+      const normalized = mints.map((mint) =>
+        mint.endsWith("/") ? mint.slice(0, -1) : mint
+      );
+      // Merge freshest state and retain known restrictions on every failure.
+      // The freshness clock advances only after both payloads are published.
+      this.adapter.setCachedMints({ ...this.adapter.getCachedMints(), [base]: normalized });
+      this.adapter.setCachedProviderInfo({ ...this.adapter.getCachedProviderInfo(), [base]: info });
+      this.lastMintFetch.set(base, Date.now());
+      return info;
+    }).finally(() => {
+      this.providerInfoRequests.delete(base);
+    });
+    this.providerInfoRequests.set(base, request);
+    return request;
   }
 
   /**
@@ -213,16 +239,31 @@ export class MintDiscovery {
     this.adapter.setCachedProviderInfo({});
   }
 
-  private isProviderDownError(error: unknown): boolean {
-    if (!(error instanceof Error)) return false;
-    const msg = error.message.toLowerCase();
-    if (msg.includes("fetch failed")) return true;
-    if (msg.includes("429")) return true;
-    if (msg.includes("502")) return true;
-    if (msg.includes("503")) return true;
-    if (msg.includes("504")) return true;
-    const cause = error.cause as { code?: string } | undefined;
-    if (cause?.code === "ENOTFOUND") return true;
-    return false;
+  /**
+   * Report reachability for one mint pass as state transitions plus a single
+   * summary, the same shape `ModelManager` uses for model refreshes. The diff
+   * itself lives in `providerOutageReport.ts`; this only emits its lines.
+   */
+  private reportProviderFailures(
+    outcomes: ProviderOutcome[],
+    freshlyFetched: Set<string>,
+    total: number,
+    elapsedMs: number
+  ): void {
+    const report = diffProviderOutage(
+      this.providerFailures,
+      outcomes,
+      freshlyFetched,
+      total,
+      elapsedMs,
+      "Mint discovery"
+    );
+    this.providerFailures = report.failures;
+
+    for (const line of report.lines) {
+      if (line.level === "warn") this.logger.warn(line.message);
+      else if (line.level === "info") this.logger.log(line.message);
+      else this.logger.debug(line.message);
+    }
   }
 }
