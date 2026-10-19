@@ -1,5 +1,7 @@
 # Routstr SDK
 
+> **Unmaintained.** This branch is a sample of an older approach to confidential mode (protocol v1: the client ran the TLS handshake alone). It is kept for reference only and will no longer be maintained. The current protocol (v2, a two-party TLS key schedule) is on the `confidential-2pc` branch; see https://github.com/jooray/routstr-confidential.
+
 This SDK lives under `sdk/` and exposes a framework-agnostic surface for Routstr API interactions. It separates business logic from UI and provides core types, discovery, client orchestration, wallet abstractions, and storage defaults.
 
 ## Entry Points
